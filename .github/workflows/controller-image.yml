@@ -1,0 +1,77 @@
+name: controller-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub deployment environment containing the Azure and deployment settings
+        type: environment
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deployment-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - run: go test ./...
+        working-directory: controller
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Validate image deployment settings
+        shell: bash
+        run: |
+          require_setting() { if [[ -z "$2" ]]; then echo "::error::Required setting $1 is missing"; exit 1; fi; }
+          require_setting NAME_PREFIX "$NAME_PREFIX"
+          require_setting ARM_SUBSCRIPTION_ID "$ARM_SUBSCRIPTION_ID"
+          require_setting ARM_CLIENT_ID "$ARM_CLIENT_ID"
+          require_setting ARM_TENANT_ID "$ARM_TENANT_ID"
+      - uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      - name: Log in to the deployment registry
+        id: acr
+        shell: bash
+        run: |
+          name="acr${NAME_PREFIX}${ARM_SUBSCRIPTION_ID:0:8}"
+          server=$(az acr show -n "$name" -g "rg-$NAME_PREFIX" --query loginServer -o tsv --only-show-errors)
+          if [[ -z "$server" ]]; then echo '::error::Registry login server is missing'; exit 1; fi
+          az acr login -n "$name" --only-show-errors
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "image=$server/controller" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: controller
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.image }}:latest
+            ${{ steps.acr.outputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

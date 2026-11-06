@@ -1,0 +1,103 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub deployment environment containing the Azure and deployment settings
+        type: environment
+        required: true
+      deploy_controller:
+        description: Deploy the controller (requires its image in ACR and credentials in Key Vault)
+        type: boolean
+        default: false
+      github_app_client_id:
+        description: GitHub App client ID (empty uses the environment setting, or PAT authentication)
+        type: string
+        default: ""
+      github_app_installation_id:
+        description: GitHub App installation ID (empty uses the environment setting)
+        type: string
+        default: ""
+      controller_image_tag:
+        description: Controller image tag to deploy
+        type: string
+        default: latest
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deployment-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      TF_VAR_location: ${{ vars.LOCATION }}
+      TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+      TF_VAR_github_config_url: ${{ vars.RUNNER_GITHUB_CONFIG_URL }}
+      TF_VAR_controller_env: ${{ vars.CONTROLLER_ENV || '{}' }}
+      TF_VAR_data_plane_operators: ${{ vars.DATA_PLANE_OPERATORS || '{}' }}
+      TF_VAR_sandbox_vnet_connection: ${{ vars.SANDBOX_VNET_CONNECTION || 'null' }}
+      TF_VAR_tags: ${{ vars.TAGS || '{}' }}
+      CI_PRINCIPAL_ID: ${{ vars.CI_PRINCIPAL_ID }}
+      CONTROLLER_ENVIRONMENT_ID: ${{ vars.CONTROLLER_ENVIRONMENT_ID }}
+      CONTROLLER_SUBNET_ID: ${{ vars.CONTROLLER_SUBNET_ID }}
+      TF_STATE_RESOURCE_GROUP: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+      TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+      TF_STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_deploy_controller: ${{ inputs.deploy_controller }}
+      TF_VAR_github_app_client_id: ${{ inputs.github_app_client_id || vars.RUNNER_GITHUB_APP_CLIENT_ID || '' }}
+      TF_VAR_github_app_installation_id: ${{ inputs.github_app_installation_id || vars.RUNNER_GITHUB_APP_INSTALLATION_ID || '0' }}
+      TF_VAR_controller_image_tag: ${{ inputs.controller_image_tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Validate deployment settings
+        shell: bash
+        run: |
+          require_setting() { if [[ -z "$2" ]]; then echo "::error::Required setting $1 is missing"; exit 1; fi; }
+          require_setting ARM_CLIENT_ID "$ARM_CLIENT_ID"
+          require_setting ARM_TENANT_ID "$ARM_TENANT_ID"
+          require_setting ARM_SUBSCRIPTION_ID "$ARM_SUBSCRIPTION_ID"
+          require_setting TF_VAR_location "$TF_VAR_location"
+          require_setting TF_VAR_name_prefix "$TF_VAR_name_prefix"
+          require_setting TF_VAR_github_config_url "$TF_VAR_github_config_url"
+          require_setting TF_STATE_RESOURCE_GROUP "$TF_STATE_RESOURCE_GROUP"
+          require_setting TF_STATE_STORAGE_ACCOUNT "$TF_STATE_STORAGE_ACCOUNT"
+          require_setting TF_STATE_CONTAINER "$TF_STATE_CONTAINER"
+          require_setting TF_STATE_KEY "$TF_STATE_KEY"
+          if [[ -n "$CI_PRINCIPAL_ID" ]]; then printf 'TF_VAR_ci_principal_id=%s\n' "$CI_PRINCIPAL_ID" >> "$GITHUB_ENV"; fi
+          if [[ -n "$CONTROLLER_ENVIRONMENT_ID" ]]; then printf 'TF_VAR_controller_environment_id=%s\n' "$CONTROLLER_ENVIRONMENT_ID" >> "$GITHUB_ENV"; fi
+          if [[ -n "$CONTROLLER_SUBNET_ID" ]]; then printf 'TF_VAR_controller_subnet_id=%s\n' "$CONTROLLER_SUBNET_ID" >> "$GITHUB_ENV"; fi
+      - uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.16.5
+      - name: Initialize persistent Terraform state
+        working-directory: infra
+        shell: bash
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=$TF_STATE_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$TF_STATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$TF_STATE_CONTAINER" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve

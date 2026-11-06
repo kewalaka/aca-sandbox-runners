@@ -1,0 +1,40 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  controller-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - name: Test controller
+        working-directory: controller
+        run: go test ./...
+
+  terraform-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.16.5
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize without a backend
+        run: terraform init -backend=false -input=false -lockfile=readonly
+      - name: Validate Terraform
+        run: terraform validate
+      - name: Test Terraform with mocked providers
+        run: terraform test
